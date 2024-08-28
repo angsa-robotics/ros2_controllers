@@ -352,6 +352,7 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
       // create a TwistStamped message from the Twist message
       auto twist_stamped = std::make_shared<Twist>();
       auto header = std_msgs::msg::Header();
+      header.stamp = get_node()->get_clock()->now();
       twist_stamped->header = header;
       twist_stamped->twist = *msg;
 
