@@ -128,7 +128,7 @@ protected:
     realtime_odometry_transform_publisher_ = nullptr;
 
   bool subscriber_is_active_ = false;
-  rclcpp::Subscription<Twist>::SharedPtr velocity_command_subscriber_ = nullptr;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr velocity_command_subscriber_ = nullptr;
 
   realtime_tools::RealtimeBox<std::shared_ptr<Twist>> received_velocity_msg_ptr_{nullptr};
 

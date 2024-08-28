@@ -332,24 +332,30 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
   previous_commands_.emplace(empty_twist);
 
   // initialize command subscriber
-  velocity_command_subscriber_ = get_node()->create_subscription<Twist>(
+  velocity_command_subscriber_ = get_node()->create_subscription<geometry_msgs::msg::Twist>(
     DEFAULT_COMMAND_TOPIC, rclcpp::SystemDefaultsQoS(),
-    [this](const std::shared_ptr<Twist> msg) -> void
+    [this](const std::shared_ptr<geometry_msgs::msg::Twist> msg) -> void
     {
       if (!subscriber_is_active_)
       {
         RCLCPP_WARN(get_node()->get_logger(), "Can't accept new commands. subscriber is inactive");
         return;
       }
-      if ((msg->header.stamp.sec == 0) && (msg->header.stamp.nanosec == 0))
-      {
-        RCLCPP_WARN_ONCE(
-          get_node()->get_logger(),
-          "Received TwistStamped with zero timestamp, setting it to current "
-          "time, this message will only be shown once");
-        msg->header.stamp = get_node()->get_clock()->now();
-      }
-      received_velocity_msg_ptr_.set(std::move(msg));
+      // if ((msg->header.stamp.sec == 0) && (msg->header.stamp.nanosec == 0))
+      // {
+      //   RCLCPP_WARN_ONCE(
+      //     get_node()->get_logger(),
+      //     "Received TwistStamped with zero timestamp, setting it to current "
+      //     "time, this message will only be shown once");
+      //   msg->header.stamp = get_node()->get_clock()->now();
+      // }
+      // create a TwistStamped message from the Twist message
+      auto twist_stamped = std::make_shared<Twist>();
+      auto header = std_msgs::msg::Header();
+      twist_stamped->header = header;
+      twist_stamped->twist = *msg;
+
+      received_velocity_msg_ptr_.set(std::move(twist_stamped));
     });
 
   // initialize odometry publisher and message
