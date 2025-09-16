@@ -27,6 +27,10 @@ three_wheel_drive_controller:
     rear_wheel_radius: 0.1     # Radius of rear wheel
     max_steering_angle: 1.57   # Max steering angle (π/2 radians = 90 degrees)
     
+    # Rear steering motor configuration
+    rear_steering_zero_offset: 0.0    # Zero position offset in motor position units
+    rear_steering_motor_ticks_per_radian: 1.0  # Conversion factor (motor_ticks/radian)
+    
     # Wheel radius multipliers (correction factors)
     wheel_separation_multiplier: 1.0
     left_wheel_radius_multiplier: 1.0

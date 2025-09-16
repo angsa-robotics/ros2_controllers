@@ -125,6 +125,14 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
   // Update the parameters
   params_ = param_listener_->get_params();
 
+  // Initialize dynamic parameter storage
+  rear_steering_zero_offset_ = params_.rear_steering_zero_offset;
+
+  // Setup parameter callback for dynamic parameters
+  auto param_callback = std::bind(
+    &ThreeWheelDriveController::dynamicParametersCallback, this, std::placeholders::_1);
+  param_callback_handle_ = get_node()->add_on_set_parameters_callback(param_callback);
+
   // Initialize odometry
   odometry_ = std::make_shared<Odometry>(params_.velocity_rolling_window_size);
 
@@ -137,11 +145,11 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
 
   odometry_->setVelocityRollingWindowSize(params_.velocity_rolling_window_size);
 
-  // Initialize steering position controller (PID)
-  steering_pid_.initialize(2.0, 0.1, 0.05, 1.0, -1.0, false);  // p, i, d, i_max, i_min, antiwindup
+  // Initialize steering position controller (PID) - Use very gentle gains to prevent oscillation
+  steering_pid_.initialize(2.0, 0.0, 0.05, 0.05, -0.05, true);  // p, i, d, i_max, i_min, antiwindup
   last_update_time_ = get_node()->get_clock()->now();
 
-  cmd_vel_timeout_ = std::chrono::milliseconds{static_cast<int>(params_.cmd_vel_timeout * 1000.0)};
+  cmd_vel_timeout_ = std::chrono::milliseconds{static_cast<int>(params_.cmd_vel_timeout * 100.0)};
 
   // Setup Publishers and subscribers
   auto qos = rclcpp::QoS(1);
@@ -423,6 +431,13 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_cleanup(
   limited_velocity_publisher_.reset();
   realtime_limited_velocity_publisher_.reset();
 
+  // Remove parameter callback
+  if (param_callback_handle_)
+  {
+    get_node()->remove_on_set_parameters_callback(param_callback_handle_.get());
+    param_callback_handle_.reset();
+  }
+
   received_velocity_msg_ptr_.set(std::make_shared<TwistStamped>());
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -444,6 +459,10 @@ bool ThreeWheelDriveController::reset()
   reset_buffers();
 
   subscriber_is_active_ = true;
+  // Reset acceleration limiter state
+  prev_left_wheel_vel_cmd_ = 0.0;
+  prev_right_wheel_vel_cmd_ = 0.0;
+  prev_rear_wheel_vel_cmd_ = 0.0;
   return true;
 }
 
@@ -468,53 +487,102 @@ void ThreeWheelDriveController::halt()
   }
 }
 
+double ThreeWheelDriveController::map_steering_angle_to_motor_position(double steering_angle_rad)
+{
+  // Map steering angle in radians to motor position units using conversion factor
+  // steering_angle_rad: -max_steering_angle to +max_steering_angle
+  // motor_position: computed from zero offset and conversion ratio
+  
+  // Clamp steering angle to valid range
+  double clamped_angle = std::max(-params_.max_steering_angle, 
+                                 std::min(params_.max_steering_angle, steering_angle_rad));
+  
+  // Convert angle to motor position using the conversion factor
+  double motor_position_offset = clamped_angle * params_.rear_steering_motor_ticks_per_radian;
+  
+  // Apply zero offset (use dynamic parameter)
+  return rear_steering_zero_offset_ + motor_position_offset;
+}
+
+double ThreeWheelDriveController::get_rear_steering_motor_min_position() const
+{
+  // Minimum position corresponds to maximum negative steering angle
+  return rear_steering_zero_offset_ - (params_.max_steering_angle * params_.rear_steering_motor_ticks_per_radian);
+}
+
+double ThreeWheelDriveController::get_rear_steering_motor_max_position() const
+{
+  // Maximum position corresponds to maximum positive steering angle
+  return rear_steering_zero_offset_ + (params_.max_steering_angle * params_.rear_steering_motor_ticks_per_radian);
+}
+
 void ThreeWheelDriveController::calculate_three_wheel_kinematics(
   double linear_velocity, double angular_velocity,
   double wheelbase, double track_width,
   double & left_wheel_vel, double & right_wheel_vel, 
   double & rear_wheel_vel, double & rear_wheel_pos)
 {
-  // Limit steering angle
-  double max_steering = params_.max_steering_angle;
-  
-  // Calculate rear wheel steering angle from linear and angular velocity
-  // Using tricycle kinematics: delta = atan(wheelbase * angular_velocity / linear_velocity)
-  if (std::abs(linear_velocity) < 1e-6)
+  // Replicate prototype kinematics from joystick_motor_control.py
+  // Inputs: linear_velocity (desired forward speed of rear wheel u), angular_velocity (desired yaw rate, CCW +)
+  // Rear wheel steering angle delta satisfies: omega = -(u / L) * sin(delta) ; front axle center speed = u * cos(delta)
+  // Solve for delta first. Handle special cases for numerical stability.
+
+  const double L = wheelbase;
+  const double W = track_width;
+  const double max_delta = params_.max_steering_angle; // should be <= pi/2
+
+  double u = linear_velocity;               // rear wheel commanded longitudinal speed
+  double omega = angular_velocity;          // desired yaw rate
+
+  // Compute steering angle from u and omega. From omega = -(u/L) * sin(delta) -> sin(delta) = -omega * L / u
+  if (std::abs(u) < 1e-6)
   {
-    // If linear velocity is very small, use maximum steering based on angular velocity direction
-    rear_wheel_pos = (angular_velocity > 0) ? max_steering : -max_steering;
+    // Pure rotation or near zero linear; choose delta to achieve rotation with minimal u.
+    // Use maximum steering to minimize required wheel speed magnitude.
+    if (std::abs(omega) < 1e-6)
+    {
+      rear_wheel_pos = 0.0; // stationary
+      left_wheel_vel = 0.0;
+      right_wheel_vel = 0.0;
+      rear_wheel_vel = 0.0;
+      return;
+    }
+    rear_wheel_pos = (omega > 0.0) ? max_delta : -max_delta;
+    // With delta = +/-90deg, sin(delta)= +/-1 -> needed rear wheel speed u = -omega * L / sin(delta) = -omega * L * sign(sin(delta))
+    // For delta = +max_delta (positive ~ +90deg) and omega>0 -> u = -omega*L (matches prototype logic sign)
+    u = -omega * L / std::sin(rear_wheel_pos); // compute minimal wheel speed producing omega
   }
   else
   {
-    rear_wheel_pos = std::atan(wheelbase * angular_velocity / linear_velocity);
+    double s = -omega * L / u;
+    if (s > 1.0) s = 1.0;
+    if (s < -1.0) s = -1.0;
+    rear_wheel_pos = std::asin(s);
   }
-  
-  // Limit steering angle
-  rear_wheel_pos = std::max(-max_steering, std::min(max_steering, rear_wheel_pos));
-  
-  // Calculate vehicle speeds using three-wheel kinematics
-  // This is based on the joystick_motor_control.py reference
-  
-  // Front wheel speeds (differential drive component)
-  double front_center_velocity = linear_velocity * std::cos(rear_wheel_pos);
-  double vehicle_angular_velocity = -(linear_velocity / wheelbase) * std::sin(rear_wheel_pos);
-  
-  left_wheel_vel = front_center_velocity - vehicle_angular_velocity * (track_width / 2.0);
-  right_wheel_vel = front_center_velocity + vehicle_angular_velocity * (track_width / 2.0);
-  
-  // Rear wheel speed 
-  rear_wheel_vel = linear_velocity;
-  
-  // Apply saturation to maintain speed ratios
-  double max_wheel_speed = 40.0;  // This should be a parameter
-  double peak_speed = std::max({std::abs(left_wheel_vel), std::abs(right_wheel_vel), std::abs(rear_wheel_vel)});
-  
-  if (peak_speed > max_wheel_speed)
+
+  // Clamp steering angle
+  if (rear_wheel_pos >  max_delta) rear_wheel_pos =  max_delta;
+  if (rear_wheel_pos < -max_delta) rear_wheel_pos = -max_delta;
+
+  // Front axle center linear speed
+  double v_front_center = u * std::cos(rear_wheel_pos);
+  // Recompute omega from consistent kinematics (authoritative relation)
+  double omega_consistent = -(u / L) * std::sin(rear_wheel_pos);
+
+  // Differential front wheel speeds about front axle center
+  left_wheel_vel  = v_front_center - omega_consistent * ( +W / 2.0 );
+  right_wheel_vel = v_front_center - omega_consistent * ( -W / 2.0 );
+  rear_wheel_vel  = u;
+
+  // Saturation preserving ratios
+  const double max_wheel_speed = 50.0; // TODO: expose as parameter
+  double peak = std::max({std::abs(left_wheel_vel), std::abs(right_wheel_vel), std::abs(rear_wheel_vel)});
+  if (peak > max_wheel_speed)
   {
-    double scale = max_wheel_speed / peak_speed;
-    left_wheel_vel *= scale;
+    double scale = max_wheel_speed / peak;
+    left_wheel_vel  *= scale;
     right_wheel_vel *= scale;
-    rear_wheel_vel *= scale;
+    rear_wheel_vel  *= scale;
   }
 }
 
@@ -545,25 +613,33 @@ controller_interface::return_type ThreeWheelDriveController::update(
     return controller_interface::return_type::ERROR;
   }
 
+  // Apply speed limiting
+  double linear_command = 0.0;
+  double angular_command = 0.0;
+  
   const auto age_of_last_command = 
     std::chrono::nanoseconds(rclcpp::Time(current_time).nanoseconds() - rclcpp::Time(last_command_msg->header.stamp).nanoseconds());
-  // Brake if cmd_vel has timeout, override the stored command
+    
+  // Check if cmd_vel has timed out
   if (age_of_last_command > cmd_vel_timeout_)
   {
-    last_command_msg->twist.linear.x = 0.0;
-    last_command_msg->twist.angular.z = 0.0;
+    // Timeout - force zero velocities and continue processing
+    linear_command = 0.0;
+    angular_command = 0.0;
+    RCLCPP_WARN_THROTTLE(logger, *(get_node()->get_clock()), 1000, 
+      "cmd_vel timeout (%.3f s) - stopping robot", static_cast<double>(age_of_last_command.count()) / 1e9);
   }
-
-  // Command is time stamped before than the last update.
-  if (rclcpp::Time(last_command_msg->header.stamp) <= rclcpp::Time(previous_update_timestamp_))
+  else if (rclcpp::Time(last_command_msg->header.stamp) <= rclcpp::Time(previous_update_timestamp_))
   {
-    RCLCPP_WARN(logger, "Received velocity command is outdated");
+    // Command is older than last update - skip processing but don't stop
     return controller_interface::return_type::OK;
   }
-
-  // Apply speed limiting
-  double linear_command = last_command_msg->twist.linear.x;
-  double angular_command = last_command_msg->twist.angular.z;
+  else
+  {
+    // Valid command - use the received velocities
+    linear_command = last_command_msg->twist.linear.x;
+    angular_command = last_command_msg->twist.angular.z;
+  }
 
   // Convert to array for limiting
   std::array<double, 2> last_vel_command = {{linear_command, angular_command}};
@@ -580,7 +656,6 @@ controller_interface::return_type ThreeWheelDriveController::update(
       previous_commands_.pop();
     }
   }
-
   auto dt = period.seconds();
 
   // Apply velocity limiting
@@ -602,35 +677,126 @@ controller_interface::return_type ThreeWheelDriveController::update(
   right_wheel_vel /= (params_.right_wheel_radius * params_.right_wheel_radius_multiplier);
   rear_wheel_vel /= (params_.rear_wheel_radius * params_.rear_wheel_radius_multiplier);
 
-  // Set commands to wheels
-  for (auto & wheel_handle : registered_left_wheel_handles_)
-  {
-    wheel_handle.velocity_command.get().set_value(left_wheel_vel);
-  }
-  for (auto & wheel_handle : registered_right_wheel_handles_)
-  {
-    wheel_handle.velocity_command.get().set_value(right_wheel_vel);
-  }
+  
+  // First, handle steering positioning
+  bool steering_at_target = true; // Assume true unless we find otherwise
+  double target_steering_pos = 0.0;
+  double current_steering_pos = 0.0;
+  double position_error = 0.0;
+  const double steering_tolerance = 0.2; // Tolerance for considering steering at target
+  
   for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
   {
-    rear_wheel_handle.velocity_command.get().set_value(rear_wheel_vel);
-    
     // Get current steering position
-    double current_steering_pos = rear_wheel_handle.position_state.get().get_value();
+    current_steering_pos = rear_wheel_handle.position_state.get().get_value();
     
-    // Calculate PID control for steering position
-    rclcpp::Time pid_current_time = get_node()->get_clock()->now();
-    rclcpp::Duration pid_dt = pid_current_time - last_update_time_;
+    // Map steering angle to motor position using parameters
+    target_steering_pos = map_steering_angle_to_motor_position(rear_wheel_pos);
     
-    // PID output (velocity command for steering) - use newer API
-    double steering_velocity_cmd = steering_pid_.compute_command(rear_wheel_pos - current_steering_pos, pid_dt);
+    // Calculate position error
+    position_error = target_steering_pos - current_steering_pos;
     
-    // Limit steering velocity
-    double max_steering_vel = 5.0; // rad/s - can be made a parameter
-    if (steering_velocity_cmd > max_steering_vel) steering_velocity_cmd = max_steering_vel;
-    if (steering_velocity_cmd < -max_steering_vel) steering_velocity_cmd = -max_steering_vel;
+    // Check if steering is at target within tolerance
+    if (std::abs(position_error) > steering_tolerance)
+    {
+      steering_at_target = false;
+    }
     
-    rear_wheel_handle.steering_velocity_command.get().set_value(steering_velocity_cmd);
+    // ---- Tunables (consider moving these to params) ----
+    const double kP         = 3.0;   // proportional gain [vel per motor-unit error]
+    const double kS         = 0.35;  // static friction feedforward [vel units]
+    const double v_max      = 5.0;   // max steering speed
+    const double v_min      = 0.20;  // min steering speed when moving
+    const double a_max      = 10.0;  // max accel (vel units per second)
+    const double deadband   = 0.05;  // stop when |error| <= deadband
+    const double slow_zone  = 0.3;   // start tapering within this error
+
+    // ---- Error ----
+    double err = position_error; // target - current (already computed)
+
+    // ---- Decide desired velocity before limits ----
+    // Base proportional term
+    double v_des = kP * err;
+
+    // ---- Decide desired velocity before limits (your code above) ----
+    // ... v_des computed (with kP, kS, v_min/v_max, slow taper, deadband) ...
+
+    // ---- Predictive anti-overshoot clamps ----
+    const double a_stop = a_max; // use same accel limit for braking
+    const double e = std::abs(err);
+    const double margin = std::max(0.0, e - deadband);
+
+    // 1) Braking-distance clamp: |v| <= sqrt(2 * a_stop * margin)
+    double v_brake = std::sqrt(2.0 * a_stop * margin);
+
+    // 2) One-timestep clamp: |v| <= margin / dt  (don't cross target next tick)
+    double v_step = (dt > 0.0) ? (margin / dt) : v_brake;
+
+    // Apply the tighter cap; keep sign of v_des
+    double v_cap = std::min(v_brake, v_step);
+    if (std::abs(v_des) > v_cap) {
+      v_des = (v_des >= 0.0 ? +v_cap : -v_cap);
+    }
+
+    // If inside deadband, force zero
+    if (e <= deadband) {
+      v_des = 0.0;
+    }
+
+    // ---- Acceleration limit (slew-rate limiting) ----
+    static double v_prev = 0.0;
+    const double dv_max = a_max * dt;
+    double v_cmd = v_prev + std::clamp(v_des - v_prev, -dv_max, dv_max);
+
+    // Zero-crossing guard: if we're about to reverse direction near target, stop cleanly
+    if ( (err > 0.0 && v_cmd < 0.0) || (err < 0.0 && v_cmd > 0.0) ) {
+      if (e < (3.0 * deadband)) {   // small hysteresis window
+        v_cmd = 0.0;
+      }
+    }
+
+    v_prev = v_cmd;
+
+    // Send to actuator
+    rear_wheel_handle.steering_velocity_command.get().set_value(v_cmd);
+  }
+  
+  // Now handle drive wheels - only move if steering is at target position
+  {
+    // Unified accel/decel limiting (also handles gating by setting desired=0 when steering not ready)
+    double dt_sec = period.seconds();
+    auto limit_accel = [dt_sec, this](double desired, double & prev) -> double
+    {
+      const double max_delta = max_wheel_accel_ * dt_sec; // symmetric accel/decel
+      double delta = desired - prev;
+      if (delta > max_delta) delta = max_delta;
+      else if (delta < -max_delta) delta = -max_delta;
+      prev += delta;
+      return prev;
+    };
+
+    // Desired rotational wheel velocities (after radius scaling already applied above)
+    double desired_left  = steering_at_target ? left_wheel_vel  : 0.0;
+    double desired_right = steering_at_target ? right_wheel_vel : 0.0;
+    double desired_rear  = steering_at_target ? -rear_wheel_vel : 0.0; // existing inversion kept
+
+    double limited_left  = limit_accel(desired_left,  prev_left_wheel_vel_cmd_);
+    double limited_right = limit_accel(desired_right, prev_right_wheel_vel_cmd_);
+    double limited_rear  = limit_accel(desired_rear,  prev_rear_wheel_vel_cmd_);
+
+    for (auto & wheel_handle : registered_left_wheel_handles_)
+    {
+      wheel_handle.velocity_command.get().set_value(limited_left);
+    }
+    for (auto & wheel_handle : registered_right_wheel_handles_)
+    {
+      wheel_handle.velocity_command.get().set_value(limited_right);
+    }
+    for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
+    {
+      rear_wheel_handle.velocity_command.get().set_value(limited_rear);
+    }
+
   }
 
   // Update odometry
@@ -769,6 +935,7 @@ controller_interface::return_type ThreeWheelDriveController::update(
 
     if (params_.enable_odom_tf && realtime_odometry_transform_publisher_->trylock())
     {
+      realtime_odometry_transform_publisher_->msg_.transforms.resize(1);
       auto & transform = realtime_odometry_transform_publisher_->msg_.transforms[0];
 
       transform.header.stamp = current_time;
@@ -810,6 +977,34 @@ void ThreeWheelDriveController::reset_buffers()
 {
   std::queue<std::array<double, 2>> empty_queue;
   previous_commands_.swap(empty_queue);
+}
+
+rcl_interfaces::msg::SetParametersResult ThreeWheelDriveController::dynamicParametersCallback(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  for (const auto & parameter : parameters)
+  {
+    if (parameter.get_name() == "rear_steering_zero_offset")
+    {
+      if (parameter.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+      {
+        rear_steering_zero_offset_ = parameter.as_double();
+        RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Updated rear_steering_zero_offset to: %f", rear_steering_zero_offset_);
+      }
+      else
+      {
+        result.successful = false;
+        result.reason = "rear_steering_zero_offset must be a double";
+      }
+    }
+  }
+
+  return result;
 }
 
 }  // namespace three_wheel_drive_controller

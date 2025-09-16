@@ -69,6 +69,17 @@ three_wheel_drive_controller:
     default_value: 1.5708, # π/2 radians (90 degrees)
     description: "Maximum steering angle for the rear wheel in radians."
   }
+  rear_steering_zero_offset: {
+    type: double,
+    default_value: 0.0,
+    description: "Zero position offset for the rear steering motor in motor position units.",
+    read_only: false
+  }
+  rear_steering_motor_ticks_per_radian: {
+    type: double,
+    default_value: 1.0,
+    description: "Conversion factor from radians to motor position units (motor_ticks/radian)."
+  }
   tf_frame_prefix_enable: {
     type: bool,
     default_value: true,

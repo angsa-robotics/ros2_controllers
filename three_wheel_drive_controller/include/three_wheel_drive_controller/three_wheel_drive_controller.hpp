@@ -31,6 +31,7 @@
 #include "realtime_tools/realtime_publisher.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 #include "control_toolbox/pid.hpp"
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
 
 #include "three_wheel_drive_controller/odometry.hpp"
 #include "three_wheel_drive_controller/speed_limiter.hpp"
@@ -110,6 +111,25 @@ struct RearWheelHandle
     double & left_wheel_vel, double & right_wheel_vel, 
     double & rear_wheel_vel, double & rear_wheel_pos);
 
+  /**
+   * \brief Map steering angle in radians to motor position units
+   * \param steering_angle_rad Steering angle in radians (-max_steering_angle to +max_steering_angle)
+   * \return Motor position in motor units
+   */
+  double map_steering_angle_to_motor_position(double steering_angle_rad);
+
+  /**
+   * \brief Get minimum motor position based on current parameters
+   * \return Minimum motor position for maximum negative steering angle
+   */
+  double get_rear_steering_motor_min_position() const;
+
+  /**
+   * \brief Get maximum motor position based on current parameters  
+   * \return Maximum motor position for maximum positive steering angle
+   */
+  double get_rear_steering_motor_max_position() const;
+
   // Parameters from ROS for three_wheel_drive_controller
   std::shared_ptr<ParamListener> param_listener_;
   Params params_;
@@ -161,13 +181,29 @@ struct RearWheelHandle
   // publish rate limiter
   double publish_rate_ = 50.0;
   rclcpp::Duration publish_period_ = rclcpp::Duration::from_nanoseconds(0);
-  rclcpp::Time previous_publish_timestamp_{0, 0, RCL_CLOCK_UNINITIALIZED};
+  rclcpp::Time previous_publish_timestamp_{0, 0, RCL_ROS_TIME};
 
   bool reset();
   void halt();
 
 private:
   void reset_buffers();
+
+  // Dynamic parameter callback
+  rcl_interfaces::msg::SetParametersResult dynamicParametersCallback(
+    const std::vector<rclcpp::Parameter> & parameters);
+
+  // Dynamic parameter storage
+  double rear_steering_zero_offset_;
+  
+  // Parameter callback handle
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+
+  // Acceleration limiting for drive wheels
+  double max_wheel_accel_ = 15.0; // m/s^2 default (can expose later as param)
+  double prev_left_wheel_vel_cmd_ = 0.0;
+  double prev_right_wheel_vel_cmd_ = 0.0;
+  double prev_rear_wheel_vel_cmd_ = 0.0;
 };
 
 }  // namespace three_wheel_drive_controller
