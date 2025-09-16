@@ -1,0 +1,9 @@
+<library path="three_wheel_drive_controller">
+  <class name="three_wheel_drive_controller/ThreeWheelDriveController" type="three_wheel_drive_controller::ThreeWheelDriveController" base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Controller for three-wheel robot with two front differential drive wheels and one rear steered wheel.
+      Subscribes to cmd_vel and computes velocity commands for both front wheels (differential drive)
+      and velocity + steering angle for the rear wheel (tricycle kinematics).
+    </description>
+  </class>
+</library>

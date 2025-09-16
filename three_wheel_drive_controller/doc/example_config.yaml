@@ -1,0 +1,72 @@
+# Example configuration file for three_wheel_drive_controller
+# This demonstrates how to configure the controller for a 3-wheel robot with:
+# - Two front differential drive wheels (left_front_wheel, right_front_wheel)  
+# - One rear steered wheel (rear_wheel)
+# - Rear steering joint (rear_steering_joint)
+
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    three_wheel_drive_controller:
+      type: three_wheel_drive_controller/ThreeWheelDriveController
+
+three_wheel_drive_controller:
+  ros__parameters:
+    # Wheel joint names
+    left_wheel_names: ["left_front_wheel"]
+    right_wheel_names: ["right_front_wheel"] 
+    rear_wheel_name: "rear_wheel"
+    rear_steering_joint_name: "rear_steering_joint"
+    
+    # Robot physical parameters (meters/radians)
+    wheel_separation: 0.5      # Distance between left and right front wheels
+    wheelbase: 0.8             # Distance from front axle to rear wheel
+    left_wheel_radius: 0.1     # Radius of left front wheel
+    right_wheel_radius: 0.1    # Radius of right front wheel
+    rear_wheel_radius: 0.1     # Radius of rear wheel
+    max_steering_angle: 1.57   # Max steering angle (π/2 radians = 90 degrees)
+    
+    # Wheel radius multipliers (correction factors)
+    wheel_separation_multiplier: 1.0
+    left_wheel_radius_multiplier: 1.0
+    right_wheel_radius_multiplier: 1.0
+    rear_wheel_radius_multiplier: 1.0
+    
+    # Odometry and TF settings
+    odom_frame_id: "odom"
+    base_frame_id: "base_link"
+    pose_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
+    twist_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
+    open_loop: false           # Use encoder feedback
+    position_feedback: true    # Use position feedback for odometry
+    enable_odom_tf: true       # Publish odom->base_link transform
+    
+    # Command and publishing settings
+    cmd_vel_timeout: 0.5       # Timeout for cmd_vel commands (seconds)
+    publish_limited_velocity: false
+    velocity_rolling_window_size: 10
+    publish_rate: 50.0         # Hz
+    
+    # Velocity and acceleration limits
+    linear:
+      x:
+        has_velocity_limits: true
+        max_velocity: 1.0      # m/s
+        min_velocity: -1.0     # m/s
+        has_acceleration_limits: true
+        max_acceleration: 1.0  # m/s²
+        max_deceleration: -1.0 # m/s²
+        has_jerk_limits: false
+        max_jerk: 5.0         # m/s³
+        
+    angular:
+      z:
+        has_velocity_limits: true
+        max_velocity: 1.0      # rad/s
+        min_velocity: -1.0     # rad/s
+        has_acceleration_limits: true
+        max_acceleration: 1.0  # rad/s²
+        max_deceleration: -1.0 # rad/s²
+        has_jerk_limits: false
+        max_jerk: 2.5         # rad/s³
