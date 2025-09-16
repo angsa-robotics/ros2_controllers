@@ -78,9 +78,9 @@ ThreeWheelDriveController::command_interface_configuration() const
     conf_names.push_back(joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
   }
 
-  // Rear wheel velocity and position commands
+  // Rear wheel velocity and steering velocity commands
   conf_names.push_back(params_.rear_wheel_name + "/" + hardware_interface::HW_IF_VELOCITY);
-  conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_POSITION);
+  conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
 
   return {interface_configuration_type::INDIVIDUAL, conf_names};
 }
@@ -136,6 +136,10 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
     params_.rear_wheel_radius * params_.rear_wheel_radius_multiplier);
 
   odometry_->setVelocityRollingWindowSize(params_.velocity_rolling_window_size);
+
+  // Initialize steering position controller (PID)
+  steering_pid_.initialize(2.0, 0.1, 0.05, 1.0, -1.0, false);  // p, i, d, i_max, i_min, antiwindup
+  last_update_time_ = get_node()->get_clock()->now();
 
   cmd_vel_timeout_ = std::chrono::milliseconds{static_cast<int>(params_.cmd_vel_timeout * 1000.0)};
 
@@ -210,13 +214,13 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
   }
 
   // Setup speed limiters
-  limiter_linear_ = std::make_unique<SpeedLimiter>(
+  limiter_linear_ = SpeedLimiter(
     params_.linear.x.min_velocity, params_.linear.x.max_velocity,
     params_.linear.x.max_acceleration_reverse, params_.linear.x.max_acceleration,
     params_.linear.x.max_deceleration, params_.linear.x.max_deceleration_reverse,
     params_.linear.x.min_jerk, params_.linear.x.max_jerk);
 
-  limiter_angular_ = std::make_unique<SpeedLimiter>(
+  limiter_angular_ = SpeedLimiter(
     params_.angular.z.min_velocity, params_.angular.z.max_velocity,
     params_.angular.z.max_acceleration_reverse, params_.angular.z.max_acceleration,
     params_.angular.z.max_deceleration, params_.angular.z.max_deceleration_reverse,
@@ -338,22 +342,24 @@ controller_interface::CallbackReturn ThreeWheelDriveController::get_rear_wheel(
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  const auto pos_command_handle = std::find_if(
+  // Get velocity command for rear steering (changed from position to velocity)
+  const auto steering_vel_interface_name = params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY;
+  const auto steering_vel_command_handle = std::find_if(
     command_interfaces_.begin(), command_interfaces_.end(),
-    [&pos_interface_name](const auto & interface)
+    [&steering_vel_interface_name](const auto & interface)
     {
-      return interface.get_name() == pos_interface_name;
+      return interface.get_name() == steering_vel_interface_name;
     });
 
-  if (pos_command_handle == command_interfaces_.end())
+  if (steering_vel_command_handle == command_interfaces_.end())
   {
-    RCLCPP_ERROR(logger, "Unable to obtain rear steering position command handle for %s", pos_interface_name.c_str());
+    RCLCPP_ERROR(logger, "Unable to obtain rear steering velocity command handle for %s", steering_vel_interface_name.c_str());
     return controller_interface::CallbackReturn::ERROR;
   }
 
   registered_handles.emplace_back(RearWheelHandle{
     std::ref(*vel_state_handle), std::ref(*vel_command_handle),
-    std::ref(*pos_state_handle), std::ref(*pos_command_handle)});
+    std::ref(*pos_state_handle), std::ref(*steering_vel_command_handle)});
 
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -458,7 +464,7 @@ void ThreeWheelDriveController::halt()
   for (const auto & rear_wheel_handle : registered_rear_wheel_handles_)
   {
     rear_wheel_handle.velocity_command.get().set_value(0.0);
-    // Keep current steering position
+    rear_wheel_handle.steering_velocity_command.get().set_value(0.0);
   }
 }
 
@@ -578,8 +584,8 @@ controller_interface::return_type ThreeWheelDriveController::update(
   auto dt = period.seconds();
 
   // Apply velocity limiting
-  limiter_linear_->limit(linear_command, prev_cmd_0[0], prev_cmd_1[0], dt);
-  limiter_angular_->limit(angular_command, prev_cmd_0[1], prev_cmd_1[1], dt);
+  limiter_linear_.limit(linear_command, prev_cmd_0[0], prev_cmd_1[0], dt);
+  limiter_angular_.limit(angular_command, prev_cmd_0[1], prev_cmd_1[1], dt);
 
   previous_commands_.emplace(last_vel_command);
   previous_update_timestamp_ = current_time;
@@ -608,7 +614,23 @@ controller_interface::return_type ThreeWheelDriveController::update(
   for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
   {
     rear_wheel_handle.velocity_command.get().set_value(rear_wheel_vel);
-    rear_wheel_handle.position_command.get().set_value(rear_wheel_pos);
+    
+    // Get current steering position
+    double current_steering_pos = rear_wheel_handle.position_state.get().get_value();
+    
+    // Calculate PID control for steering position
+    rclcpp::Time pid_current_time = get_node()->get_clock()->now();
+    rclcpp::Duration pid_dt = pid_current_time - last_update_time_;
+    
+    // PID output (velocity command for steering) - use newer API
+    double steering_velocity_cmd = steering_pid_.compute_command(rear_wheel_pos - current_steering_pos, pid_dt);
+    
+    // Limit steering velocity
+    double max_steering_vel = 5.0; // rad/s - can be made a parameter
+    if (steering_velocity_cmd > max_steering_vel) steering_velocity_cmd = max_steering_vel;
+    if (steering_velocity_cmd < -max_steering_vel) steering_velocity_cmd = -max_steering_vel;
+    
+    rear_wheel_handle.steering_velocity_command.get().set_value(steering_velocity_cmd);
   }
 
   // Update odometry
@@ -776,6 +798,9 @@ controller_interface::return_type ThreeWheelDriveController::update(
     limited_velocity_command.twist.angular.z = angular_command;
     realtime_limited_velocity_publisher_->unlockAndPublish();
   }
+
+  // Update time for next iteration
+  last_update_time_ = get_node()->get_clock()->now();
 
   is_halted = false;
   return controller_interface::return_type::OK;

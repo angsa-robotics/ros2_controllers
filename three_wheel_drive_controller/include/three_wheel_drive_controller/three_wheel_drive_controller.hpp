@@ -30,6 +30,7 @@
 #include "realtime_tools/realtime_thread_safe_box.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
+#include "control_toolbox/pid.hpp"
 
 #include "three_wheel_drive_controller/odometry.hpp"
 #include "three_wheel_drive_controller/speed_limiter.hpp"
@@ -74,15 +75,13 @@ struct WheelHandle
   std::reference_wrapper<const hardware_interface::LoanedStateInterface> velocity_state;
   std::reference_wrapper<hardware_interface::LoanedCommandInterface> velocity_command;
 };  // Rear wheel handles for traction and steering
-  struct RearWheelHandle
-  {
-    std::reference_wrapper<const hardware_interface::LoanedStateInterface> velocity_state;
-    std::reference_wrapper<hardware_interface::LoanedCommandInterface> velocity_command;
-    std::reference_wrapper<const hardware_interface::LoanedStateInterface> position_state;
-    std::reference_wrapper<hardware_interface::LoanedCommandInterface> position_command;
-  };
-
-  CallbackReturn get_wheel(
+struct RearWheelHandle
+{
+  std::reference_wrapper<const hardware_interface::LoanedStateInterface> velocity_state;
+  std::reference_wrapper<hardware_interface::LoanedCommandInterface> velocity_command;
+  std::reference_wrapper<const hardware_interface::LoanedStateInterface> position_state;
+  std::reference_wrapper<hardware_interface::LoanedCommandInterface> steering_velocity_command;
+};  CallbackReturn get_wheel(
     const std::string & wheel_name, const std::vector<std::string> & wheel_names,
     std::vector<WheelHandle> & registered_handles);
 
@@ -140,9 +139,13 @@ struct WheelHandle
   // Timeout to consider cmd_vel commands old  
   std::chrono::milliseconds cmd_vel_timeout_{500};
 
-  // Speed limiters
-  std::unique_ptr<SpeedLimiter> limiter_linear_;
-  std::unique_ptr<SpeedLimiter> limiter_angular_;
+    // Speed limiters
+  three_wheel_drive_controller::SpeedLimiter limiter_linear_;
+  three_wheel_drive_controller::SpeedLimiter limiter_angular_;
+
+  // Position controller for steering
+  control_toolbox::Pid steering_pid_;
+  rclcpp::Time last_update_time_;
 
   // Limited velocity publisher
   bool publish_limited_velocity_ = false;
