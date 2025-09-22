@@ -80,6 +80,11 @@ three_wheel_drive_controller:
     default_value: 1.0,
     description: "Conversion factor from radians to motor position units (motor_ticks/radian)."
   }
+  enable_rear_steering: {
+    type: bool,
+    default_value: true,
+    description: "Enable active rear steering. Set false if steering motor/joint is absent; controller will operate as front differential + passive rear wheel (rear steering angle locked to 0)."
+  }
   tf_frame_prefix_enable: {
     type: bool,
     default_value: true,

@@ -78,9 +78,12 @@ ThreeWheelDriveController::command_interface_configuration() const
     conf_names.push_back(joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
   }
 
-  // Rear wheel velocity and steering velocity commands
+  // Rear wheel velocity command always; steering command only if enabled
   conf_names.push_back(params_.rear_wheel_name + "/" + hardware_interface::HW_IF_VELOCITY);
-  conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
+  if (params_.enable_rear_steering)
+  {
+    conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY);
+  }
 
   return {interface_configuration_type::INDIVIDUAL, conf_names};
 }
@@ -108,13 +111,16 @@ ThreeWheelDriveController::state_interface_configuration() const
     }
   }
 
-  // Rear wheel velocity and position states
+  // Rear wheel velocity and position states (steering position only if enabled)
   conf_names.push_back(params_.rear_wheel_name + "/" + hardware_interface::HW_IF_VELOCITY);
   if (params_.position_feedback)
   {
     conf_names.push_back(params_.rear_wheel_name + "/" + hardware_interface::HW_IF_POSITION);
   }
-  conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_POSITION);
+  if (params_.enable_rear_steering)
+  {
+    conf_names.push_back(params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_POSITION);
+  }
 
   return {interface_configuration_type::INDIVIDUAL, conf_names};
 }
@@ -145,11 +151,9 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
 
   odometry_->setVelocityRollingWindowSize(params_.velocity_rolling_window_size);
 
-  // Initialize steering position controller (PID) - Use very gentle gains to prevent oscillation
-  steering_pid_.initialize(2.0, 0.0, 0.05, 0.05, -0.05, true);  // p, i, d, i_max, i_min, antiwindup
   last_update_time_ = get_node()->get_clock()->now();
 
-  cmd_vel_timeout_ = std::chrono::milliseconds{static_cast<int>(params_.cmd_vel_timeout * 100.0)};
+  cmd_vel_timeout_ = std::chrono::milliseconds{static_cast<int>(params_.cmd_vel_timeout * 1000.0)};
 
   // Setup Publishers and subscribers
   auto qos = rclcpp::QoS(1);
@@ -188,6 +192,19 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_configure(
         msg->header.stamp = get_node()->now();
       }
       received_velocity_msg_ptr_.set(std::move(msg));
+    });
+
+  // Steering angle difference subscriber
+  steering_angle_diff_subscriber_ = get_node()->create_subscription<std_msgs::msg::Float32>(
+    "/steering_angle_diff", qos,
+    [this](const std::shared_ptr<std_msgs::msg::Float32> msg) -> void
+    {
+      if (!subscriber_is_active_)
+      {
+        RCLCPP_WARN(get_node()->get_logger(), "Steering angle difference received before activation");
+        return;
+      }
+      received_steering_diff_msg_ptr_.set(std::move(msg));
     });
 
   // Publishers
@@ -335,39 +352,51 @@ controller_interface::CallbackReturn ThreeWheelDriveController::get_rear_wheel(
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  // Get position state and command for rear steering
-  const auto pos_interface_name = params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_POSITION;
-  const auto pos_state_handle = std::find_if(
-    state_interfaces_.cbegin(), state_interfaces_.cend(),
-    [&pos_interface_name](const auto & interface)
-    {
-      return interface.get_name() == pos_interface_name;
-    });
+  RCLCPP_INFO(logger, "Successfully found rear wheel velocity interfaces: %s", vel_interface_name.c_str());
 
-  if (pos_state_handle == state_interfaces_.cend())
+  if (params_.enable_rear_steering)
   {
-    RCLCPP_ERROR(logger, "Unable to obtain rear steering position state handle for %s", pos_interface_name.c_str());
-    return controller_interface::CallbackReturn::ERROR;
-  }
+    // Get position state and command for rear steering
+    const auto pos_interface_name = params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_POSITION;
+    const auto pos_state_handle = std::find_if(
+      state_interfaces_.cbegin(), state_interfaces_.cend(),
+      [&pos_interface_name](const auto & interface)
+      {
+        return interface.get_name() == pos_interface_name;
+      });
 
-  // Get velocity command for rear steering (changed from position to velocity)
-  const auto steering_vel_interface_name = params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY;
-  const auto steering_vel_command_handle = std::find_if(
-    command_interfaces_.begin(), command_interfaces_.end(),
-    [&steering_vel_interface_name](const auto & interface)
+    if (pos_state_handle == state_interfaces_.cend())
     {
-      return interface.get_name() == steering_vel_interface_name;
-    });
+      RCLCPP_ERROR(logger, "Unable to obtain rear steering position state handle for %s", pos_interface_name.c_str());
+      return controller_interface::CallbackReturn::ERROR;
+    }
 
-  if (steering_vel_command_handle == command_interfaces_.end())
-  {
-    RCLCPP_ERROR(logger, "Unable to obtain rear steering velocity command handle for %s", steering_vel_interface_name.c_str());
-    return controller_interface::CallbackReturn::ERROR;
+    // Get velocity command for rear steering (changed from position to velocity)
+    const auto steering_vel_interface_name = params_.rear_steering_joint_name + "/" + hardware_interface::HW_IF_VELOCITY;
+    const auto steering_vel_command_handle = std::find_if(
+      command_interfaces_.begin(), command_interfaces_.end(),
+      [&steering_vel_interface_name](const auto & interface)
+      {
+        return interface.get_name() == steering_vel_interface_name;
+      });
+
+    if (steering_vel_command_handle == command_interfaces_.end())
+    {
+      RCLCPP_ERROR(logger, "Unable to obtain rear steering velocity command handle for %s", steering_vel_interface_name.c_str());
+      return controller_interface::CallbackReturn::ERROR;
+    }
+
+    registered_handles.emplace_back(RearWheelHandle{
+      std::ref(*vel_state_handle), std::ref(*vel_command_handle),
+      std::ref(*pos_state_handle), std::ref(*steering_vel_command_handle)});
   }
-
-  registered_handles.emplace_back(RearWheelHandle{
-    std::ref(*vel_state_handle), std::ref(*vel_command_handle),
-    std::ref(*pos_state_handle), std::ref(*steering_vel_command_handle)});
+  else
+  {
+    // Steering disabled: reuse velocity state/command handles for position/steering command placeholders.
+    registered_handles.emplace_back(RearWheelHandle{
+      std::ref(*vel_state_handle), std::ref(*vel_command_handle),
+      std::ref(*vel_state_handle), std::ref(*vel_command_handle)});
+  }
 
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -424,6 +453,7 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_cleanup(
 {
   reset_buffers();
   velocity_command_subscriber_.reset();
+  steering_angle_diff_subscriber_.reset();
   odometry_publisher_.reset();
   realtime_odometry_publisher_.reset();
   odometry_transform_publisher_.reset();
@@ -439,6 +469,7 @@ controller_interface::CallbackReturn ThreeWheelDriveController::on_cleanup(
   }
 
   received_velocity_msg_ptr_.set(std::make_shared<TwistStamped>());
+  received_steering_diff_msg_ptr_.set(std::make_shared<std_msgs::msg::Float32>());
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -455,6 +486,7 @@ bool ThreeWheelDriveController::reset()
 
   // Set last velocity to zero
   received_velocity_msg_ptr_.set(std::make_shared<TwistStamped>());
+  received_steering_diff_msg_ptr_.set(std::make_shared<std_msgs::msg::Float32>());
 
   reset_buffers();
 
@@ -463,6 +495,7 @@ bool ThreeWheelDriveController::reset()
   prev_left_wheel_vel_cmd_ = 0.0;
   prev_right_wheel_vel_cmd_ = 0.0;
   prev_rear_wheel_vel_cmd_ = 0.0;
+  steering_at_target_ = true;
   return true;
 }
 
@@ -547,7 +580,7 @@ void ThreeWheelDriveController::calculate_three_wheel_kinematics(
       rear_wheel_vel = 0.0;
       return;
     }
-    rear_wheel_pos = (omega > 0.0) ? max_delta : -max_delta;
+    rear_wheel_pos = (omega > 0.0) ? -max_delta : max_delta;
     // With delta = +/-90deg, sin(delta)= +/-1 -> needed rear wheel speed u = -omega * L / sin(delta) = -omega * L * sign(sin(delta))
     // For delta = +max_delta (positive ~ +90deg) and omega>0 -> u = -omega*L (matches prototype logic sign)
     u = -omega * L / std::sin(rear_wheel_pos); // compute minimal wheel speed producing omega
@@ -606,6 +639,19 @@ controller_interface::return_type ThreeWheelDriveController::update(
   
   std::shared_ptr<TwistStamped> last_command_msg;
   received_velocity_msg_ptr_.get(last_command_msg);
+
+  // Check steering angle difference for gating drive commands
+  // Only use topic value when rear steering is not handled by this controller
+  if (!params_.enable_rear_steering)
+  {
+    std::shared_ptr<std_msgs::msg::Float32> steering_diff_msg;
+    received_steering_diff_msg_ptr_.get(steering_diff_msg);
+    
+    if (steering_diff_msg != nullptr)
+    {
+      steering_at_target_ = steering_diff_msg->data < steering_position_tolerance_;
+    }
+  }
 
   if (last_command_msg == nullptr)
   {
@@ -667,10 +713,21 @@ controller_interface::return_type ThreeWheelDriveController::update(
 
   // Calculate wheel speeds and steering angle
   double left_wheel_vel, right_wheel_vel, rear_wheel_vel, rear_wheel_pos;
-  calculate_three_wheel_kinematics(
-    linear_command, angular_command,
-    params_.wheelbase, params_.wheel_separation,
-    left_wheel_vel, right_wheel_vel, rear_wheel_vel, rear_wheel_pos);
+  if (params_.enable_rear_steering)
+  {
+    calculate_three_wheel_kinematics(
+      linear_command, angular_command,
+      params_.wheelbase, params_.wheel_separation,
+      left_wheel_vel, right_wheel_vel, rear_wheel_vel, rear_wheel_pos);
+  }
+  else
+  {
+    calculate_three_wheel_kinematics(
+      linear_command, angular_command,
+      params_.wheelbase, params_.wheel_separation,
+      left_wheel_vel, right_wheel_vel, rear_wheel_vel, rear_wheel_pos);
+    rear_wheel_pos  = 0.0;
+  }
 
   // Apply wheel radius scaling  
   left_wheel_vel /= (params_.left_wheel_radius * params_.left_wheel_radius_multiplier);
@@ -679,86 +736,56 @@ controller_interface::return_type ThreeWheelDriveController::update(
 
   
   // First, handle steering positioning
-  bool steering_at_target = true; // Assume true unless we find otherwise
   double target_steering_pos = 0.0;
   double current_steering_pos = 0.0;
   double position_error = 0.0;
   const double steering_tolerance = 0.2; // Tolerance for considering steering at target
   
-  for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
+  if (params_.enable_rear_steering)
   {
-    // Get current steering position
-    current_steering_pos = rear_wheel_handle.position_state.get().get_value();
+    // When rear steering is handled by this controller, calculate steering_at_target locally
+    bool local_steering_at_target = true;
     
-    // Map steering angle to motor position using parameters
-    target_steering_pos = map_steering_angle_to_motor_position(rear_wheel_pos);
-    
-    // Calculate position error
-    position_error = target_steering_pos - current_steering_pos;
-    
-    // Check if steering is at target within tolerance
-    if (std::abs(position_error) > steering_tolerance)
+    for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
     {
-      steering_at_target = false;
+      current_steering_pos = rear_wheel_handle.position_state.get().get_value();
+      target_steering_pos = map_steering_angle_to_motor_position(rear_wheel_pos);
+      position_error = target_steering_pos - current_steering_pos;
+      
+      if (std::abs(position_error) > steering_tolerance)
+      {
+        local_steering_at_target = false;
+      }
+      
+      const double kP         = 3.0;
+      const double kS         = 0.35;
+      const double v_max      = 5.0;
+      const double v_min      = 0.20;
+      const double a_max      = 10.0;
+      const double deadband   = 0.05;
+      const double slow_zone  = 0.3;
+      double err = position_error;
+      double v_des = kP * err;
+      const double a_stop = a_max;
+      const double e = std::abs(err);
+      const double margin = std::max(0.0, e - deadband);
+      double v_brake = std::sqrt(2.0 * a_stop * margin);
+      double v_step = (dt > 0.0) ? (margin / dt) : v_brake;
+      double v_cap = std::min(v_brake, v_step);
+      if (std::abs(v_des) > v_cap) { v_des = (v_des >= 0.0 ? +v_cap : -v_cap); }
+      if (e <= deadband) { v_des = 0.0; }
+      static double v_prev = 0.0;
+      const double dv_max = a_max * dt;
+      double v_cmd = v_prev + std::clamp(v_des - v_prev, -dv_max, dv_max);
+      if ( (err > 0.0 && v_cmd < 0.0) || (err < 0.0 && v_cmd > 0.0) ) {
+        if (e < (3.0 * deadband)) { v_cmd = 0.0; }
+      }
+      v_prev = v_cmd;
+      rear_wheel_handle.steering_velocity_command.get().set_value(v_cmd);
     }
     
-    // ---- Tunables (consider moving these to params) ----
-    const double kP         = 3.0;   // proportional gain [vel per motor-unit error]
-    const double kS         = 0.35;  // static friction feedforward [vel units]
-    const double v_max      = 5.0;   // max steering speed
-    const double v_min      = 0.20;  // min steering speed when moving
-    const double a_max      = 10.0;  // max accel (vel units per second)
-    const double deadband   = 0.05;  // stop when |error| <= deadband
-    const double slow_zone  = 0.3;   // start tapering within this error
-
-    // ---- Error ----
-    double err = position_error; // target - current (already computed)
-
-    // ---- Decide desired velocity before limits ----
-    // Base proportional term
-    double v_des = kP * err;
-
-    // ---- Decide desired velocity before limits (your code above) ----
-    // ... v_des computed (with kP, kS, v_min/v_max, slow taper, deadband) ...
-
-    // ---- Predictive anti-overshoot clamps ----
-    const double a_stop = a_max; // use same accel limit for braking
-    const double e = std::abs(err);
-    const double margin = std::max(0.0, e - deadband);
-
-    // 1) Braking-distance clamp: |v| <= sqrt(2 * a_stop * margin)
-    double v_brake = std::sqrt(2.0 * a_stop * margin);
-
-    // 2) One-timestep clamp: |v| <= margin / dt  (don't cross target next tick)
-    double v_step = (dt > 0.0) ? (margin / dt) : v_brake;
-
-    // Apply the tighter cap; keep sign of v_des
-    double v_cap = std::min(v_brake, v_step);
-    if (std::abs(v_des) > v_cap) {
-      v_des = (v_des >= 0.0 ? +v_cap : -v_cap);
-    }
-
-    // If inside deadband, force zero
-    if (e <= deadband) {
-      v_des = 0.0;
-    }
-
-    // ---- Acceleration limit (slew-rate limiting) ----
-    static double v_prev = 0.0;
-    const double dv_max = a_max * dt;
-    double v_cmd = v_prev + std::clamp(v_des - v_prev, -dv_max, dv_max);
-
-    // Zero-crossing guard: if we're about to reverse direction near target, stop cleanly
-    if ( (err > 0.0 && v_cmd < 0.0) || (err < 0.0 && v_cmd > 0.0) ) {
-      if (e < (3.0 * deadband)) {   // small hysteresis window
-        v_cmd = 0.0;
-      }
-    }
-
-    v_prev = v_cmd;
-
-    // Send to actuator
-    rear_wheel_handle.steering_velocity_command.get().set_value(v_cmd);
+    // Update the member variable with locally calculated status
+    steering_at_target_ = local_steering_at_target;
   }
   
   // Now handle drive wheels - only move if steering is at target position
@@ -776,13 +803,21 @@ controller_interface::return_type ThreeWheelDriveController::update(
     };
 
     // Desired rotational wheel velocities (after radius scaling already applied above)
-    double desired_left  = steering_at_target ? left_wheel_vel  : 0.0;
-    double desired_right = steering_at_target ? right_wheel_vel : 0.0;
-    double desired_rear  = steering_at_target ? -rear_wheel_vel : 0.0; // existing inversion kept
+    // Use member variable steering_at_target_ instead of local variable
+    double desired_left  = steering_at_target_ ? left_wheel_vel  : 0.0;
+    double desired_right = steering_at_target_ ? right_wheel_vel : 0.0;
+    double desired_rear  = steering_at_target_ ? rear_wheel_vel : 0.0; // existing inversion kept
 
     double limited_left  = limit_accel(desired_left,  prev_left_wheel_vel_cmd_);
     double limited_right = limit_accel(desired_right, prev_right_wheel_vel_cmd_);
     double limited_rear  = limit_accel(desired_rear,  prev_rear_wheel_vel_cmd_);
+
+    RCLCPP_INFO_THROTTLE(
+      logger, *(get_node()->get_clock()), 500,
+      "Cmd (lin, ang)=(%.3f, %.3f) -> wheel cmd (L, R, Re)=(%.3f, %.3f, %.3f) (desired (L, R, Re)=(%.3f, %.3f, %.3f))",
+      linear_command, angular_command,
+      limited_left, limited_right, limited_rear,
+      desired_left, desired_right, desired_rear);
 
     for (auto & wheel_handle : registered_left_wheel_handles_)
     {
@@ -795,6 +830,11 @@ controller_interface::return_type ThreeWheelDriveController::update(
     for (auto & rear_wheel_handle : registered_rear_wheel_handles_)
     {
       rear_wheel_handle.velocity_command.get().set_value(limited_rear);
+      if (!params_.enable_rear_steering)
+      {
+        // Ensure no steering command output when disabled
+        // rear_wheel_handle.steering_velocity_command.get().set_value(0.0);
+      }
     }
 
   }
@@ -860,7 +900,10 @@ controller_interface::return_type ThreeWheelDriveController::update(
     for (const auto & rear_wheel_handle : registered_rear_wheel_handles_)
     {
       rear_vel += rear_wheel_handle.velocity_state.get().get_value();
-      rear_steering_pos += rear_wheel_handle.position_state.get().get_value();
+      if (params_.enable_rear_steering)
+      {
+        rear_steering_pos += rear_wheel_handle.position_state.get().get_value();
+      }
       if (params_.position_feedback)
       {
         // Find position state interface for rear wheel
@@ -879,7 +922,7 @@ controller_interface::return_type ThreeWheelDriveController::update(
     }
     rear_vel /= static_cast<double>(registered_rear_wheel_handles_.size());
     rear_pos /= static_cast<double>(registered_rear_wheel_handles_.size());
-    rear_steering_pos /= static_cast<double>(registered_rear_wheel_handles_.size());
+    rear_steering_pos = params_.enable_rear_steering ? (rear_steering_pos / static_cast<double>(registered_rear_wheel_handles_.size())) : 0.0;
 
     // Apply wheel radius for odometry
     left_vel *= (params_.left_wheel_radius * params_.left_wheel_radius_multiplier);

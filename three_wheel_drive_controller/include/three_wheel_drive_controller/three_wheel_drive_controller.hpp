@@ -26,6 +26,7 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "realtime_tools/realtime_thread_safe_box.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
@@ -156,6 +157,10 @@ struct RearWheelHandle
   rclcpp::Subscription<TwistStamped>::SharedPtr velocity_command_subscriber_ = nullptr;
   realtime_tools::RealtimeThreadSafeBox<std::shared_ptr<TwistStamped>> received_velocity_msg_ptr_{nullptr};
 
+  // Steering angle difference subscriber
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr steering_angle_diff_subscriber_ = nullptr;
+  realtime_tools::RealtimeThreadSafeBox<std::shared_ptr<std_msgs::msg::Float32>> received_steering_diff_msg_ptr_{nullptr};
+
   // Timeout to consider cmd_vel commands old  
   std::chrono::milliseconds cmd_vel_timeout_{500};
 
@@ -163,8 +168,6 @@ struct RearWheelHandle
   three_wheel_drive_controller::SpeedLimiter limiter_linear_;
   three_wheel_drive_controller::SpeedLimiter limiter_angular_;
 
-  // Position controller for steering
-  control_toolbox::Pid steering_pid_;
   rclcpp::Time last_update_time_;
 
   // Limited velocity publisher
@@ -204,6 +207,10 @@ private:
   double prev_left_wheel_vel_cmd_ = 0.0;
   double prev_right_wheel_vel_cmd_ = 0.0;
   double prev_rear_wheel_vel_cmd_ = 0.0;
+
+  // Steering position tracking
+  bool steering_at_target_ = true;
+  double steering_position_tolerance_ = 0.1; // radians (about 6 degrees)
 };
 
 }  // namespace three_wheel_drive_controller

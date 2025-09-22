@@ -30,6 +30,7 @@ three_wheel_drive_controller:
     # Rear steering motor configuration
     rear_steering_zero_offset: 0.0    # Zero position offset in motor position units
     rear_steering_motor_ticks_per_radian: 1.0  # Conversion factor (motor_ticks/radian)
+  enable_rear_steering: true  # Set to false when steering motor is removed; controller falls back to diff-drive + passive rear wheel
     
     # Wheel radius multipliers (correction factors)
     wheel_separation_multiplier: 1.0
