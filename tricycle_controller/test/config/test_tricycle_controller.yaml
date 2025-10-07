@@ -2,9 +2,11 @@
 test_tricycle_controller:
   ros__parameters:
     traction_joint_name: traction_joint
+    rear_wheels_names: [rear_left_wheel_joint, rear_right_wheel_joint]
     steering_joint_name: steering_joint
     wheel_radius: 0.125
     wheelbase: 1.252
+    rear_wheel_track: 0.85
     enable_odom_tf: false
     use_sim_time: false
     pose_covariance_diagonal: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

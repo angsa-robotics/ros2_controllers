@@ -72,6 +72,10 @@ InterfaceConfiguration TricycleController::command_interface_configuration() con
   InterfaceConfiguration command_interfaces_config;
   command_interfaces_config.type = interface_configuration_type::INDIVIDUAL;
   command_interfaces_config.names.push_back(params_.traction_joint_name + "/" + HW_IF_VELOCITY);
+  for (const auto & rear_wheel_name : params_.rear_wheels_names)
+  {
+    command_interfaces_config.names.push_back(rear_wheel_name + "/" + HW_IF_VELOCITY);
+  }
   command_interfaces_config.names.push_back(params_.steering_joint_name + "/" + HW_IF_POSITION);
   return command_interfaces_config;
 }
@@ -81,6 +85,10 @@ InterfaceConfiguration TricycleController::state_interface_configuration() const
   InterfaceConfiguration state_interfaces_config;
   state_interfaces_config.type = interface_configuration_type::INDIVIDUAL;
   state_interfaces_config.names.push_back(params_.traction_joint_name + "/" + HW_IF_VELOCITY);
+  for (const auto & rear_wheel_name : params_.rear_wheels_names)
+  {
+    state_interfaces_config.names.push_back(rear_wheel_name + "/" + HW_IF_VELOCITY);
+  }
   state_interfaces_config.names.push_back(params_.steering_joint_name + "/" + HW_IF_POSITION);
   return state_interfaces_config;
 }
@@ -88,6 +96,7 @@ InterfaceConfiguration TricycleController::state_interface_configuration() const
 controller_interface::return_type TricycleController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
+  bool hold_angle = false;
   // if the mutex is unable to lock, last_command_msg_ won't be updated
   received_velocity_msg_ptr_.try_get([this](const std::shared_ptr<TwistStamped> & msg)
                                      { last_command_msg_ = msg; });
@@ -103,6 +112,7 @@ controller_interface::return_type TricycleController::update(
   {
     last_command_msg_->twist.linear.x = 0.0;
     last_command_msg_->twist.angular.z = 0.0;
+    hold_angle = true;
   }
 
   // command may be limited further by Limiters,
@@ -174,21 +184,43 @@ controller_interface::return_type TricycleController::update(
   // Compute wheel velocity and angle
   auto [alpha_write, Ws_write] = twist_to_ackermann(linear_command, angular_command);
 
+  // Constrain steering angle to [-100, 100] degrees by reversing wheel direction if needed
+  // 100 degrees = 1.745329 radians
+  constexpr double MAX_STEERING_ANGLE = 100.0 * M_PI / 180.0;  // ~1.745 radians
+  
+  // Normalize alpha_write to [-pi, pi] first
+  while (alpha_write > M_PI) alpha_write -= 2 * M_PI;
+  while (alpha_write < -M_PI) alpha_write += 2 * M_PI;
+  
+  // If steering angle exceeds ±100 degrees, flip to the equivalent angle by reversing wheel direction
+  if (std::abs(alpha_write) > MAX_STEERING_ANGLE)
+  {
+    // Flip steering angle by 180 degrees and reverse wheel rotation
+    alpha_write += (alpha_write > 0) ? -M_PI : M_PI;
+    Ws_write = -Ws_write;  // Reverse wheel rotation direction
+  }
+  
+  // Calculate angle difference for velocity scaling
+  double alpha_delta = alpha_write - alpha_read;
+  // Normalize alpha_delta to [-pi, pi]
+  while (alpha_delta > M_PI) alpha_delta -= 2 * M_PI;
+  while (alpha_delta < -M_PI) alpha_delta += 2 * M_PI;
+
   // Reduce wheel speed until the target angle has been reached
-  double alpha_delta = abs(alpha_write - alpha_read);
   double scale;
-  if (alpha_delta < M_PI / 6)
+  double abs_alpha_delta = std::abs(alpha_delta);
+  if (abs_alpha_delta < M_PI / 6)
   {
     scale = 1;
   }
-  else if (alpha_delta > M_PI_2)
+  else if (abs_alpha_delta > M_PI_2)
   {
     scale = 0.01;
   }
   else
   {
     // TODO(anyone): find the best function, e.g convex power functions
-    scale = cos(alpha_delta);
+    scale = cos(abs_alpha_delta);
   }
   Ws_write *= scale;
 
@@ -207,6 +239,11 @@ controller_interface::return_type TricycleController::update(
   // speed in AckermannDrive is defined as desired forward speed (m/s) but it is used here as wheel
   // speed (rad/s)
   ackermann_command.speed = static_cast<float>(Ws_write);
+  if (hold_angle)
+  {
+    alpha_write = alpha_read;
+  }
+
   ackermann_command.steering_angle = static_cast<float>(alpha_write);
   previous_commands_.emplace(ackermann_command);
 
@@ -226,6 +263,53 @@ controller_interface::return_type TricycleController::update(
       get_node()->get_logger(),
       "Unable to set the velocity command for traction joint to value: '%f'.", Ws_write);
   }
+  
+  // Command rear wheels with differential velocities based on Ackermann geometry
+    // Calculate the turning radius at the rear axle center
+    // When alpha (steering angle) is 0, we're going straight
+    // When alpha != 0, we need to compute different velocities for left/right rear wheels
+    
+  double rear_left_velocity, rear_right_velocity;
+  
+  if (std::abs(alpha_write) < 1e-6)  // Straight line motion
+  {
+    rear_left_velocity = rear_right_velocity = Ws_write;
+  }
+  else
+  {
+    // Calculate turning radius at rear axle center using Ackermann geometry
+    // R = wheelbase / tan(alpha)
+    double turning_radius = params_.wheelbase / std::tan(alpha_write);
+    
+    // Calculate angular velocity of the robot: omega = v / R
+    // where v is the linear velocity at the rear axle center
+    double rear_linear_velocity = Ws_write * params_.wheel_radius * std::cos(alpha_write);
+    double angular_velocity = rear_linear_velocity / turning_radius;
+    
+    // For each rear wheel: v_wheel = v_center + omega * offset
+    // Left wheel is offset by -track/2, right wheel by +track/2 (assuming right is positive)
+    double rear_left_linear = rear_linear_velocity - angular_velocity * (params_.rear_wheel_track / 2.0);
+    double rear_right_linear = rear_linear_velocity + angular_velocity * (params_.rear_wheel_track / 2.0);
+    
+    // Convert linear velocities back to angular velocities (rad/s)
+    rear_left_velocity = rear_left_linear / params_.wheel_radius;
+    rear_right_velocity = rear_right_linear / params_.wheel_radius;
+  }
+  
+  // Assuming rear_wheels_[0] is left, rear_wheels_[1] is right
+  if (!rear_wheels_[0].velocity_command.get().set_value(rear_left_velocity))
+  {
+    RCLCPP_WARN(
+      get_node()->get_logger(),
+      "Unable to set the velocity command for left rear wheel to value: '%f'.", rear_left_velocity);
+  }
+  if (!rear_wheels_[1].velocity_command.get().set_value(rear_right_velocity))
+  {
+    RCLCPP_WARN(
+      get_node()->get_logger(),
+      "Unable to set the velocity command for right rear wheel to value: '%f'.", rear_right_velocity);
+  }
+
   if (!steering_joint_[0].position_command.get().set_value(alpha_write))
   {
     RCLCPP_WARN(
@@ -271,7 +355,8 @@ CallbackReturn TricycleController::on_configure(const rclcpp_lifecycle::State & 
     limiter_steering_ = SteeringLimiter(
       params_.steering.min_position, params_.steering.max_position, params_.steering.min_velocity,
       params_.steering.max_velocity, params_.steering.min_acceleration,
-      params_.steering.max_acceleration);
+      params_.steering.max_acceleration, params_.steering.min_deceleration,
+      params_.steering.max_deceleration);
   }
   catch (const std::invalid_argument & e)
   {
@@ -378,6 +463,19 @@ CallbackReturn TricycleController::on_activate(const rclcpp_lifecycle::State &)
   // Initialize the joints
   const auto wheel_front_result = get_traction(params_.traction_joint_name, traction_joint_);
   const auto steering_result = get_steering(params_.steering_joint_name, steering_joint_);
+  
+  // Initialize rear wheels
+  for (const auto & rear_wheel_name : params_.rear_wheels_names)
+  {
+    const auto rear_result = get_traction(rear_wheel_name, rear_wheels_);
+    if (rear_result == CallbackReturn::ERROR)
+    {
+      RCLCPP_ERROR(
+        get_node()->get_logger(), "Failed to initialize rear wheel: %s", rear_wheel_name.c_str());
+      return CallbackReturn::ERROR;
+    }
+  }
+  
   if (wheel_front_result == CallbackReturn::ERROR || steering_result == CallbackReturn::ERROR)
   {
     return CallbackReturn::ERROR;
@@ -386,6 +484,12 @@ CallbackReturn TricycleController::on_activate(const rclcpp_lifecycle::State &)
   {
     RCLCPP_ERROR(
       get_node()->get_logger(), "Either steering or traction interfaces are non existent");
+    return CallbackReturn::ERROR;
+  }
+  if (rear_wheels_.size() != params_.rear_wheels_names.size())
+  {
+    RCLCPP_ERROR(
+      get_node()->get_logger(), "Not all rear wheel interfaces were initialized properly");
     return CallbackReturn::ERROR;
   }
 
@@ -439,6 +543,7 @@ bool TricycleController::reset()
   std::swap(previous_commands_, empty_ackermann_drive);
 
   traction_joint_.clear();
+  rear_wheels_.clear();
   steering_joint_.clear();
 
   subscriber_is_active_ = false;
@@ -456,12 +561,17 @@ void TricycleController::halt()
       get_node()->get_logger(),
       "Unable to set the velocity command for traction joint to value 0.0");
   }
-  if (!steering_joint_[0].position_command.get().set_value(0.0))
+  // Stop rear wheels
+  for (size_t i = 0; i < rear_wheels_.size(); ++i)
   {
-    RCLCPP_WARN(
-      get_node()->get_logger(),
-      "Unable to set the position command for steering joint to value 0.0");
+    if (!rear_wheels_[i].velocity_command.get().set_value(0.0))
+    {
+      RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Unable to set the velocity command for rear wheel %zu to value 0.0", i);
+    }
   }
+  // Steering maintains its current position (no reset to center)
 }
 
 CallbackReturn TricycleController::get_traction(
@@ -555,7 +665,7 @@ double TricycleController::convert_trans_rot_vel_to_steering_angle(
   {
     return 0;
   }
-  return std::atan(theta_dot * wheelbase / Vx);
+  return std::atan2(theta_dot * wheelbase, Vx);
 }
 
 std::tuple<double, double> TricycleController::twist_to_ackermann(double Vx, double theta_dot)

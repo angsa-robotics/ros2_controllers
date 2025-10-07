@@ -2,9 +2,20 @@ tricycle_controller:
   traction_joint_name: {
     type: string,
     default_value: "",
-    description: "Name of the traction joint",
+    description: "Name of the front traction joint (steered wheel)",
     validation: {
       not_empty<>: []
+    }
+  }
+  rear_wheels_names: {
+    type: string_array,
+    default_value: [],
+    description: "Names of the rear wheel joints",
+    validation: {
+      size_gt<>: [0],
+      size_lt<>: [3],
+      not_empty<>: [],
+      unique<>: null,
     }
   }
   steering_joint_name: {
@@ -19,6 +30,14 @@ tricycle_controller:
     type: double,
     default_value: 0.0,
     description: "Shortest distance between the front wheel and the rear axle. If this parameter is wrong, the robot will not behave correctly in curves.",
+    validation: {
+      gt<>: [0.0]
+    }
+  }
+  rear_wheel_track: {
+    type: double,
+    default_value: 0.0,
+    description: "Distance between the two rear wheels (track width). Required for computing differential rear wheel velocities during turns.",
     validation: {
       gt<>: [0.0]
     }
@@ -147,4 +166,14 @@ tricycle_controller:
     min_acceleration: {
       type: double,
       default_value: .NAN,
+    }
+    max_deceleration: {
+      type: double,
+      default_value: .NAN,
+      description: "Maximum deceleration [m/s^2] or [rad/s^2]. If not set, uses max_acceleration value.",
+    }
+    min_deceleration: {
+      type: double,
+      default_value: .NAN,
+      description: "Minimum deceleration [m/s^2] or [rad/s^2]. If not set, uses min_acceleration value.",
     }
