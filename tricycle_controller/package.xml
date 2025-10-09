@@ -35,7 +35,6 @@
   <depend>rclcpp_lifecycle</depend>
   <depend>rcpputils</depend>
   <depend>realtime_tools</depend>
-  <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2</depend>
   <depend>tf2_msgs</depend>

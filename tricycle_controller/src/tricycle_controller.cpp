@@ -27,7 +27,6 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "rclcpp/logging.hpp"
-#include "std_msgs/msg/float64.hpp"
 #include "tf2/LinearMath/Quaternion.hpp"
 #include "tricycle_controller/tricycle_controller.hpp"
 
@@ -38,8 +37,6 @@ constexpr auto DEFAULT_ACKERMANN_OUT_TOPIC = "~/cmd_ackermann";
 constexpr auto DEFAULT_ODOMETRY_TOPIC = "~/odom";
 constexpr auto DEFAULT_TRANSFORM_TOPIC = "/tf";
 constexpr auto DEFAULT_RESET_ODOM_SERVICE = "~/reset_odometry";
-constexpr auto DEFAULT_STEERING_ANGLE_COMMAND_TOPIC = "~/steering_angle_command";
-constexpr auto DEFAULT_STEERING_ANGLE_STATE_TOPIC = "~/steering_angle_state";
 }  // namespace
 
 namespace tricycle_controller
@@ -136,13 +133,6 @@ controller_interface::return_type TricycleController::update(
 
   double Ws_read = Ws_read_op.value();        // in radians/s
   double alpha_read = alpha_read_op.value();  // in radians
-
-  received_steering_angle_ptr_.try_get([this](const std::shared_ptr<std_msgs::msg::Float64> & msg)
-                                        { last_steering_angle_msg_ = msg; });
-  if (last_steering_angle_msg_ != nullptr)
-  {
-    alpha_read = last_steering_angle_msg_->data;
-  }
 
   if (params_.open_loop)
   {
@@ -320,12 +310,6 @@ controller_interface::return_type TricycleController::update(
       "Unable to set the velocity command for right rear wheel to value: '%f'.", rear_right_velocity);
   }
 
-  // Publish steering angle command (alpha_write) for external steering control
-    std_msgs::msg::Float64 steering_angle_msg;
-    steering_angle_msg.data = alpha_write;
-    realtime_steering_angle_command_publisher_->try_publish(steering_angle_msg);
-
-
   if (!steering_joint_[0].position_command.get().set_value(alpha_write))
   {
     RCLCPP_WARN(
@@ -402,30 +386,6 @@ CallbackReturn TricycleController::on_configure(const rclcpp_lifecycle::State & 
       std::make_shared<realtime_tools::RealtimePublisher<AckermannDrive>>(
         ackermann_command_publisher_);
   }
-
-  // Initialize steering angle command publisher (publishes alpha_write)
-  steering_angle_command_publisher_ = get_node()->create_publisher<std_msgs::msg::Float64>(
-    DEFAULT_STEERING_ANGLE_COMMAND_TOPIC, rclcpp::SystemDefaultsQoS());
-  realtime_steering_angle_command_publisher_ =
-    std::make_shared<realtime_tools::RealtimePublisher<std_msgs::msg::Float64>>(
-      steering_angle_command_publisher_);
-
-  last_steering_angle_msg_ = std::make_shared<std_msgs::msg::Float64>();
-  received_steering_angle_ptr_.set([this](std::shared_ptr<std_msgs::msg::Float64> & stored_value)
-                                    { stored_value = last_steering_angle_msg_; });
-  
-  steering_angle_state_subscriber_ = get_node()->create_subscription<std_msgs::msg::Float64>(
-    DEFAULT_STEERING_ANGLE_STATE_TOPIC, rclcpp::SystemDefaultsQoS(),
-    [this](const std::shared_ptr<std_msgs::msg::Float64> msg) -> void
-    {
-      if (!subscriber_is_active_)
-      {
-        RCLCPP_WARN(get_node()->get_logger(), "Can't accept new steering commands. subscriber is inactive");
-        return;
-      }
-      received_steering_angle_ptr_.set([msg](std::shared_ptr<std_msgs::msg::Float64> & stored_value)
-                                        { stored_value = std::move(msg); });
-    });
 
   // initialize command subscriber
   velocity_command_subscriber_ = get_node()->create_subscription<TwistStamped>(
@@ -588,10 +548,8 @@ bool TricycleController::reset()
 
   subscriber_is_active_ = false;
   velocity_command_subscriber_.reset();
-  steering_angle_state_subscriber_.reset();
 
   received_velocity_msg_ptr_.set(nullptr);
-  received_steering_angle_ptr_.set(nullptr);
   return true;
 }
 

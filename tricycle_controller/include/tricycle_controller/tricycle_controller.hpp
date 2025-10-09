@@ -35,7 +35,6 @@
 #include "rclcpp_lifecycle/state.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 #include "realtime_tools/realtime_thread_safe_box.hpp"
-#include "std_msgs/msg/float64.hpp"
 #include "std_srvs/srv/empty.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 
@@ -132,17 +131,6 @@ protected:
   realtime_tools::RealtimeThreadSafeBox<std::shared_ptr<TwistStamped>> received_velocity_msg_ptr_{
     nullptr};
   std::shared_ptr<TwistStamped> last_command_msg_;
-
-  // Steering angle publisher and subscriber
-  std::shared_ptr<rclcpp::Publisher<std_msgs::msg::Float64>> steering_angle_command_publisher_ = nullptr;
-  std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::msg::Float64>>
-    realtime_steering_angle_command_publisher_ = nullptr;
-  
-  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr steering_angle_state_subscriber_ = nullptr;
-  realtime_tools::RealtimeThreadSafeBox<std::shared_ptr<std_msgs::msg::Float64>> received_steering_angle_ptr_{
-    nullptr};
-  std::shared_ptr<std_msgs::msg::Float64> last_steering_angle_msg_;
-  bool use_external_steering_control_ = false;
 
   rclcpp::Service<std_srvs::srv::Empty>::SharedPtr reset_odom_service_;
 
