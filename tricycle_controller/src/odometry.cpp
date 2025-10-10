@@ -39,7 +39,7 @@ bool Odometry::update(double Ws, double alpha, const rclcpp::Duration & dt)
   // using naming convention in http://users.isr.ist.utl.pt/~mir/cadeiras/robmovel/Kinematics.pdf
   double Vs = Ws * wheel_radius_;
   double Vx = Vs * std::cos(alpha);
-  double theta_dot = Vs * std::sin(alpha) / wheelbase_;
+  double theta_dot = - Vs * std::sin(alpha) / wheelbase_;
 
   // Integrate odometry:
   integrateExact(Vx * dt.seconds(), theta_dot * dt.seconds());

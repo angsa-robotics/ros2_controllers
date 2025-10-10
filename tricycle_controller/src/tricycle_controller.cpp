@@ -96,7 +96,6 @@ InterfaceConfiguration TricycleController::state_interface_configuration() const
 controller_interface::return_type TricycleController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  bool hold_angle = false;
   // if the mutex is unable to lock, last_command_msg_ won't be updated
   received_velocity_msg_ptr_.try_get([this](const std::shared_ptr<TwistStamped> & msg)
                                      { last_command_msg_ = msg; });
@@ -112,14 +111,18 @@ controller_interface::return_type TricycleController::update(
   {
     last_command_msg_->twist.linear.x = 0.0;
     last_command_msg_->twist.angular.z = 0.0;
-    hold_angle = true;
   }
 
   // command may be limited further by Limiters,
   // without affecting the stored twist command
   TwistStamped command = *last_command_msg_;
   double & linear_command = command.twist.linear.x;
-  double & angular_command = command.twist.angular.z;
+  double & angular_command2 = command.twist.angular.z;
+  double angular_command = angular_command2 * -1;
+  
+  // Check if this is a stop command (both linear and angular are zero)
+  bool is_stop_command = (std::abs(linear_command) < 1e-6 && std::abs(angular_command) < 1e-6);
+  
   auto Ws_read_op = traction_joint_[0].velocity_state.get().get_optional();
   auto alpha_read_op = steering_joint_[0].position_state.get().get_optional();
 
@@ -184,43 +187,86 @@ controller_interface::return_type TricycleController::update(
   // Compute wheel velocity and angle
   auto [alpha_write, Ws_write] = twist_to_ackermann(linear_command, angular_command);
 
-  // Constrain steering angle to [-100, 100] degrees by reversing wheel direction if needed
-  // 100 degrees = 1.745329 radians
-  constexpr double MAX_STEERING_ANGLE = 100.0 * M_PI / 180.0;  // ~1.745 radians
-  
-  // Normalize alpha_write to [-pi, pi] first
-  while (alpha_write > M_PI) alpha_write -= 2 * M_PI;
-  while (alpha_write < -M_PI) alpha_write += 2 * M_PI;
-  
-  // If steering angle exceeds ±100 degrees, flip to the equivalent angle by reversing wheel direction
-  if (std::abs(alpha_write) > MAX_STEERING_ANGLE)
+  // If this is a stop command, preserve the current actual steering angle
+  if (is_stop_command)
   {
-    // Flip steering angle by 180 degrees and reverse wheel rotation
-    alpha_write += (alpha_write > 0) ? -M_PI : M_PI;
-    Ws_write = -Ws_write;  // Reverse wheel rotation direction
+    alpha_write = alpha_read;
   }
-  
-  // Calculate angle difference for velocity scaling
-  double alpha_delta = alpha_write - alpha_read;
-  // Normalize alpha_delta to [-pi, pi]
-  while (alpha_delta > M_PI) alpha_delta -= 2 * M_PI;
-  while (alpha_delta < -M_PI) alpha_delta += 2 * M_PI;
+  else
+  {
+    // Find the equivalent angle closest to alpha_read to minimize rotation
+    // Since steering angles are equivalent modulo π (not 2π), we check both
+    // the angle and the angle ± π (with reversed wheel direction)
+    
+    // Get steering limits
+    double min_steering = -1.745;
+    double max_steering = 1.745;
+    
+    // Generate equivalent angle options
+    std::vector<std::pair<double, bool>> valid_options;  // {angle, reverse_wheel}
+    
+    // Option 1: Original angle
+    if (alpha_write >= min_steering && alpha_write <= max_steering)
+    {
+      valid_options.push_back({alpha_write, false});
+    }
+    
+    // Option 2: Angle + π (with reversed wheel)
+    double alpha_plus_pi = alpha_write + M_PI;
+    if (alpha_plus_pi >= min_steering && alpha_plus_pi <= max_steering)
+    {
+      valid_options.push_back({alpha_plus_pi, true});
+    }
+    
+    // Option 3: Angle - π (with reversed wheel)
+    double alpha_minus_pi = alpha_write - M_PI;
+    if (alpha_minus_pi >= min_steering && alpha_minus_pi <= max_steering)
+    {
+      valid_options.push_back({alpha_minus_pi, true});
+    }
+    
+    // Choose the valid option closest to alpha_read
+    if (!valid_options.empty())
+    {
+      double min_diff = std::numeric_limits<double>::max();
+      double best_alpha = alpha_write;
+      bool reverse_wheel = false;
+      
+      for (const auto & [angle, should_reverse] : valid_options)
+      {
+        double diff = std::abs(angle - alpha_read);
+        if (diff < min_diff)
+        {
+          min_diff = diff;
+          best_alpha = angle;
+          reverse_wheel = should_reverse;
+        }
+      }
+      
+      alpha_write = best_alpha;
+      if (reverse_wheel)
+      {
+        Ws_write = -Ws_write;  // Reverse wheel direction
+      }
+    }
+    // If no valid options (shouldn't happen with proper limits), keep original alpha_write
+  }
 
   // Reduce wheel speed until the target angle has been reached
+  double alpha_delta = abs(alpha_write - alpha_read);
   double scale;
-  double abs_alpha_delta = std::abs(alpha_delta);
-  if (abs_alpha_delta < M_PI / 6)
+  if (alpha_delta < M_PI / 6)
   {
     scale = 1;
   }
-  else if (abs_alpha_delta > M_PI_2)
+  else if (alpha_delta > M_PI_2)
   {
     scale = 0.01;
   }
   else
   {
     // TODO(anyone): find the best function, e.g convex power functions
-    scale = cos(abs_alpha_delta);
+    scale = cos(alpha_delta);
   }
   Ws_write *= scale;
 
@@ -239,11 +285,6 @@ controller_interface::return_type TricycleController::update(
   // speed in AckermannDrive is defined as desired forward speed (m/s) but it is used here as wheel
   // speed (rad/s)
   ackermann_command.speed = static_cast<float>(Ws_write);
-  if (hold_angle)
-  {
-    alpha_write = alpha_read;
-  }
-
   ackermann_command.steering_angle = static_cast<float>(alpha_write);
   previous_commands_.emplace(ackermann_command);
 
@@ -270,31 +311,24 @@ controller_interface::return_type TricycleController::update(
     // When alpha != 0, we need to compute different velocities for left/right rear wheels
     
   double rear_left_velocity, rear_right_velocity;
+
+  // Calculate turning radius at rear axle center using Ackermann geometry
+  // R = wheelbase / tan(alpha)
+  double turning_radius = params_.wheelbase / std::tan(alpha_write);
   
-  if (std::abs(alpha_write) < 1e-6)  // Straight line motion
-  {
-    rear_left_velocity = rear_right_velocity = Ws_write;
-  }
-  else
-  {
-    // Calculate turning radius at rear axle center using Ackermann geometry
-    // R = wheelbase / tan(alpha)
-    double turning_radius = params_.wheelbase / std::tan(alpha_write);
-    
-    // Calculate angular velocity of the robot: omega = v / R
-    // where v is the linear velocity at the rear axle center
-    double rear_linear_velocity = Ws_write * params_.wheel_radius * std::cos(alpha_write);
-    double angular_velocity = rear_linear_velocity / turning_radius;
-    
-    // For each rear wheel: v_wheel = v_center + omega * offset
-    // Left wheel is offset by -track/2, right wheel by +track/2 (assuming right is positive)
-    double rear_left_linear = rear_linear_velocity - angular_velocity * (params_.rear_wheel_track / 2.0);
-    double rear_right_linear = rear_linear_velocity + angular_velocity * (params_.rear_wheel_track / 2.0);
-    
-    // Convert linear velocities back to angular velocities (rad/s)
-    rear_left_velocity = rear_left_linear / params_.wheel_radius;
-    rear_right_velocity = rear_right_linear / params_.wheel_radius;
-  }
+  // Calculate angular velocity of the robot: omega = v / R
+  // where v is the linear velocity at the rear axle center
+  double rear_linear_velocity = Ws_write * params_.wheel_radius * std::cos(alpha_write);
+  double angular_velocity = rear_linear_velocity / turning_radius;
+  
+  // For each rear wheel: v_wheel = v_center + omega * offset
+  // Left wheel is offset by -track/2, right wheel by +track/2 (assuming right is positive)
+  double rear_left_linear = rear_linear_velocity - angular_velocity * (params_.rear_wheel_track / 2.0);
+  double rear_right_linear = rear_linear_velocity + angular_velocity * (params_.rear_wheel_track / 2.0);
+  
+  // Convert linear velocities back to angular velocities (rad/s)
+  rear_left_velocity = rear_left_linear / params_.wheel_radius;
+  rear_right_velocity = rear_right_linear / params_.wheel_radius;
   
   // Assuming rear_wheels_[0] is left, rear_wheels_[1] is right
   if (!rear_wheels_[0].velocity_command.get().set_value(rear_left_velocity))
