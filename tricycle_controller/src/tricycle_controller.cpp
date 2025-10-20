@@ -197,30 +197,27 @@ controller_interface::return_type TricycleController::update(
     // Find the equivalent angle closest to alpha_read to minimize rotation
     // Since steering angles are equivalent modulo π (not 2π), we check both
     // the angle and the angle ± π (with reversed wheel direction)
-    
-    // Get steering limits
-    double min_steering = -1.745;
-    double max_steering = 1.745;
+  
     
     // Generate equivalent angle options
     std::vector<std::pair<double, bool>> valid_options;  // {angle, reverse_wheel}
     
     // Option 1: Original angle
-    if (alpha_write >= min_steering && alpha_write <= max_steering)
+    if (alpha_write >= params_.steering.min_position && alpha_write <= params_.steering.max_position)
     {
       valid_options.push_back({alpha_write, false});
     }
     
     // Option 2: Angle + π (with reversed wheel)
     double alpha_plus_pi = alpha_write + M_PI;
-    if (alpha_plus_pi >= min_steering && alpha_plus_pi <= max_steering)
+    if (alpha_plus_pi >= params_.steering.min_position && alpha_plus_pi <= params_.steering.max_position)
     {
       valid_options.push_back({alpha_plus_pi, true});
     }
     
     // Option 3: Angle - π (with reversed wheel)
     double alpha_minus_pi = alpha_write - M_PI;
-    if (alpha_minus_pi >= min_steering && alpha_minus_pi <= max_steering)
+    if (alpha_minus_pi >= params_.steering.min_position && alpha_minus_pi <= params_.steering.max_position)
     {
       valid_options.push_back({alpha_minus_pi, true});
     }
