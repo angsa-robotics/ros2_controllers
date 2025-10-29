@@ -101,6 +101,7 @@ protected:
 
   // HACK: put into vector to avoid initializing structs because they have no default constructors
   std::vector<TractionHandle> traction_joint_;
+  std::vector<TractionHandle> rear_wheels_;
   std::vector<SteeringHandle> steering_joint_;
 
   std::shared_ptr<rclcpp::Publisher<AckermannDrive>> ackermann_command_publisher_ = nullptr;

@@ -26,13 +26,16 @@ namespace tricycle_controller
 {
 SteeringLimiter::SteeringLimiter(
   double min_position, double max_position, double min_velocity, double max_velocity,
-  double min_acceleration, double max_acceleration)
+  double min_acceleration, double max_acceleration, double min_deceleration,
+  double max_deceleration)
 : min_position_(min_position),
   max_position_(max_position),
   min_velocity_(min_velocity),
   max_velocity_(max_velocity),
   min_acceleration_(min_acceleration),
-  max_acceleration_(max_acceleration)
+  max_acceleration_(max_acceleration),
+  min_deceleration_(min_deceleration),
+  max_deceleration_(max_deceleration)
 {
   if (!std::isnan(min_position_) && std::isnan(max_position_)) max_position_ = -min_position_;
   if (!std::isnan(max_position_) && std::isnan(min_position_)) min_position_ = -max_position_;
@@ -43,6 +46,20 @@ SteeringLimiter::SteeringLimiter(
 
   if (!std::isnan(min_acceleration_) && std::isnan(max_acceleration_)) max_acceleration_ = 1000.0;
   if (!std::isnan(max_acceleration_) && std::isnan(min_acceleration_)) min_acceleration_ = 0.0;
+
+  // Handle deceleration limits - if not specified, use acceleration limits
+  if (std::isnan(min_deceleration_) && std::isnan(max_deceleration_))
+  {
+    min_deceleration_ = min_acceleration_;
+    max_deceleration_ = max_acceleration_;
+  }
+  else
+  {
+    if (!std::isnan(min_deceleration_) && std::isnan(max_deceleration_))
+      max_deceleration_ = 1000.0;
+    if (!std::isnan(max_deceleration_) && std::isnan(min_deceleration_))
+      min_deceleration_ = 0.0;
+  }
 
   const std::string error =
     "The positive limit will be applied to both directions. Setting different limits for positive "
@@ -58,13 +75,19 @@ SteeringLimiter::SteeringLimiter(
   {
     throw std::invalid_argument("Acceleration cannot be negative." + error);
   }
+
+  if (min_deceleration_ < 0 || max_deceleration_ < 0)
+  {
+    throw std::invalid_argument("Deceleration cannot be negative." + error);
+  }
 }
 
 double SteeringLimiter::limit(double & p, double p0, double p1, double dt)
 {
   const double tmp = p;
 
-  if (!std::isnan(min_acceleration_) && !std::isnan(max_acceleration_))
+  if (!std::isnan(min_acceleration_) && !std::isnan(max_acceleration_) &&
+      !std::isnan(min_deceleration_) && !std::isnan(max_deceleration_))
     limit_acceleration(p, p0, p1, dt);
   if (!std::isnan(min_velocity_) && !std::isnan(max_velocity_)) limit_velocity(p, p0, dt);
   if (!std::isnan(min_position_) && !std::isnan(max_position_)) limit_position(p);
@@ -98,13 +121,42 @@ double SteeringLimiter::limit_acceleration(double & p, double p0, double p1, dou
 {
   const double tmp = p;
 
-  const double dv = p - p0;
-  const double dp0 = p0 - p1;
+  const double dv = p - p0;       // Current velocity change
+  const double dp0 = p0 - p1;     // Previous velocity change
 
   const double dt2 = 2. * dt * dt;
 
-  const double da_min = min_acceleration_ * dt2;
-  const double da_max = max_acceleration_ * dt2;
+  // Determine if we're accelerating or decelerating based on velocity change direction
+  // Acceleration: |dv| > |dp0| (speeding up)
+  // Deceleration: |dv| < |dp0| (slowing down)
+  const double abs_dv = std::fabs(dv);
+  const double abs_dp0 = std::fabs(dp0);
+  
+  // Check if we're decelerating (reducing speed)
+  bool is_decelerating = false;
+  if (abs_dp0 > 1e-6)  // Avoid division by small numbers
+  {
+    // If the new velocity change is smaller in magnitude than the previous, we're decelerating
+    is_decelerating = abs_dv < abs_dp0;
+  }
+  else if (abs_dv > 1e-6)
+  {
+    // If previous was near zero but current is moving away from target, it's acceleration
+    is_decelerating = false;
+  }
+
+  // Select appropriate limits based on whether we're accelerating or decelerating
+  double da_min, da_max;
+  if (is_decelerating)
+  {
+    da_min = min_deceleration_ * dt2;
+    da_max = max_deceleration_ * dt2;
+  }
+  else
+  {
+    da_min = min_acceleration_ * dt2;
+    da_max = max_acceleration_ * dt2;
+  }
 
   double da = std::clamp(std::fabs(dv - dp0), da_min, da_max);
   da *= (dv - dp0 >= 0 ? 1 : -1);

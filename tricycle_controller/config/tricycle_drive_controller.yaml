@@ -1,10 +1,12 @@
 tricycle_controller:
   ros__parameters:
     # Model
-    traction_joint_name: traction_joint # Name of traction joint in URDF
+    traction_joint_name: traction_joint # Name of front traction joint (steered wheel) in URDF
+    rear_wheels_names: [rear_left_wheel_joint, rear_right_wheel_joint] # Names of rear wheel joints in URDF
     steering_joint_name: steering_joint # Name of steering joint in URDF
     wheel_radius: 0.0 # Radius of front wheel
     wheelbase: 0.0 # Distance between center of back wheels and front wheel
+    rear_wheel_track: 0.0 # Distance between the two rear wheels (track width)
 
     # Odometry
     odom_frame_id: odom
@@ -33,6 +35,8 @@ tricycle_controller:
       max_velocity: 1.0
       # min_acceleration: 0.0
       # max_acceleration: 1000.0
+      # min_deceleration: 0.0  # If not set, uses min_acceleration
+      # max_deceleration: 1000.0  # If not set, uses max_acceleration
 
     # cmd_vel input
     cmd_vel_timeout: 500 # In milliseconds. Timeout to stop if no cmd_vel is received
