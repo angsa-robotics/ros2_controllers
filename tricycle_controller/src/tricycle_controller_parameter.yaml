@@ -151,6 +151,11 @@ tricycle_controller:
       type: double,
       default_value: .NAN,
     }
+    hysteresis_threshold: {
+      type: double,
+      default_value: 0.0,
+      description: "Hysteresis threshold in radians for steering angle limits. When the current steering angle is near the min/max limits, only switch to a new target angle if the difference exceeds this threshold. This prevents flickering between extreme angles.",
+    }
     max_velocity: {
       type: double,
       default_value: .NAN,

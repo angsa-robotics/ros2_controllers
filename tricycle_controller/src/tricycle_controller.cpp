@@ -247,6 +247,28 @@ controller_interface::return_type TricycleController::update(
       }
     }
     // If no valid options (shouldn't happen with proper limits), keep original alpha_write
+    
+    // Apply hysteresis at steering limits to prevent flickering
+    // Check if current angle is near the min limit
+    bool near_min_limit = (alpha_read <= params_.steering.min_position + params_.steering.hysteresis_threshold);
+    // Check if current angle is near the max limit
+    bool near_max_limit = (alpha_read >= params_.steering.max_position - params_.steering.hysteresis_threshold);
+    
+    if (near_min_limit || near_max_limit)
+    {
+      // Only switch to the new target angle if it's significantly different
+      double angle_difference = std::abs(alpha_write - alpha_read);
+      
+      if (angle_difference < params_.steering.hysteresis_threshold)
+      {
+        RCLCPP_INFO_THROTTLE(
+          get_node()->get_logger(), *get_node()->get_clock(), 1000,
+          "Steering angle near limit; applying hysteresis to prevent flickering.");
+        // Stay at current angle to prevent flickering
+        alpha_write = alpha_read;
+      }
+      // else: the difference is large enough, proceed with the new target angle
+    }
   }
 
   // Reduce wheel speed until the target angle has been reached
